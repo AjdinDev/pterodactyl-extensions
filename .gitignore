@@ -1,0 +1,14 @@
+# macOS metadata and Python bytecode
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Workstation instructions and private local test state
+/.agents/
+/local/
+
+# Generated packages, screenshots, and browser scratch files
+/artifacts/
+/output/
+/.playwright-cli/

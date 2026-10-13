@@ -1,0 +1,35 @@
+{
+    "$schema": "./node_modules/@pterodactyl/sdk/manifest.schema.json",
+    "id": "database-studio",
+    "name": "Database Studio",
+    "version": "0.1.0",
+    "requires": {
+        "panel": "^2.0.0-dev",
+        "sdk": "^2.0.0-beta.4",
+        "php": "^8.3"
+    },
+    "description": "Browse, query, edit, import and export managed MySQL databases.",
+    "author": "Ajdin Lokvancic - ajdin.be (https://builtbybit.com/members/ajdin.6353/)",
+    "provider": "DatabaseStudio\\DatabaseStudioProvider",
+    "ui": {
+        "entry": "dist/client.js",
+        "mode": "native",
+        "prefix": "ds",
+        "screens": [
+            {
+                "id": "main",
+                "area": "server",
+                "path": "database-studio",
+                "nav": {
+                    "label": "Database Studio"
+                },
+                "permission": [
+                    "ext.database-studio.read"
+                ],
+                "when": {
+                    "runtime": true
+                }
+            }
+        ]
+    }
+}

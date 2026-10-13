@@ -1,0 +1,207 @@
+name: Build and release extensions
+
+on:
+  workflow_dispatch:
+    inputs:
+      extension:
+        description: Extension to build
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - cs2-admins
+          - database-studio
+          - discord-status
+          - gamequery
+          - support-tickets
+      create_release:
+        description: Create a GitHub release for each selected extension
+        type: boolean
+        default: false
+      draft:
+        description: Create the release as a draft
+        type: boolean
+        default: true
+      prerelease:
+        description: Mark the release as a prerelease
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PANEL_COMMIT: 8e07ac97ab42d6b65b144ebf81d5f47da4f4fad1
+
+jobs:
+  build:
+    name: Validate, build, and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PTERODACTYL_PANEL: ${{ github.workspace }}/.ci/panel
+      APP_ENV: testing
+      APP_ENVIRONMENT_ONLY: 'true'
+      PTERODACTYL_EXTENSIONS_ENABLED: 'false'
+      CACHE_DRIVER: file
+      SESSION_DRIVER: file
+      QUEUE_CONNECTION: sync
+    steps:
+      - name: Check out extension source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: '*/package-lock.json'
+
+      - name: Set up PHP and Composer
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.4'
+          extensions: curl, dom, gd, intl, mbstring, pdo_mysql, posix, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Check out the official Panel packager
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pterodactyl/panel
+          ref: ${{ env.PANEL_COMMIT }}
+          path: .ci/panel
+          persist-credentials: false
+
+      - name: Prepare the packager
+        working-directory: .ci/panel
+        run: |
+          cp .env.example .env
+          composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts
+          php artisan package:discover --ansi
+          php artisan key:generate --force --ansi
+
+      - name: Build installable extensions
+        env:
+          EXTENSION: ${{ inputs.extension }}
+        run: bash tooling/build-release.sh "$EXTENSION"
+
+      - name: Upload packages and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: extensions-${{ inputs.extension }}-${{ github.run_id }}
+          path: output/release/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  release:
+    name: Create GitHub release
+    needs: build
+    if: inputs.create_release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the built commit and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: extensions-${{ inputs.extension }}-${{ github.run_id }}
+          path: output/release/
+
+      - name: Create release with installable packages
+        working-directory: output/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          sha256sum -c SHA256SUMS
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import zipfile
+          from pathlib import Path
+
+          info = json.loads(Path('BUILD-INFO.json').read_text())
+          if info['source_commit'] != os.environ['GITHUB_SHA']:
+              raise SystemExit('Build artifacts do not match the selected commit.')
+          plan = []
+          for extension in info['extensions']:
+              extension_id, version = extension['id'], extension['version']
+              if not re.fullmatch(r'[a-z][a-z0-9-]*', extension_id) or not re.fullmatch(
+                  r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', version
+              ):
+                  raise SystemExit('Invalid packaged extension ID or version.')
+              archive = Path(f'{extension_id}-{version}.pteroext')
+              if extension['file'] != archive.name:
+                  raise SystemExit('Archive filename does not match its ID/version.')
+              with zipfile.ZipFile(archive) as package:
+                  manifest = json.loads(package.read('extension.json'))
+              if (manifest['id'], manifest['version']) != (extension_id, version):
+                  raise SystemExit('Packaged manifest does not match build metadata.')
+              # Derive the tag from the verified archived manifest, never user input.
+              tag = f"{manifest['id']}/v{manifest['version']}"
+              metadata = Path(f'{archive.stem}.build.json')
+              metadata.write_text(json.dumps({**info, 'extensions': [extension]}, indent=2) + '\n')
+              checksum = Path(f'{archive.stem}.sha256')
+              checksum.write_text(''.join(
+                  f'{hashlib.sha256(file.read_bytes()).hexdigest()}  {file.name}\n'
+                  for file in (archive, metadata)
+              ))
+              lines = [f"Installable {manifest['name']} version `{version}`.", '',
+                       f"Source commit: `{info['source_commit']}`",
+                       f"Panel packager: `{info['panel_commit']}`", '',
+                       f'Verify downloads with `sha256sum -c {checksum.name}`.', '',
+                       'Build validation does not establish runtime compatibility on other Panel versions.']
+              if manifest.get('requires', {}).get('extensions'):
+                  lines += ['', 'Required enabled extensions:'] + [
+                      f'- `{dependency}` `{constraint}`'
+                      for dependency, constraint in manifest['requires']['extensions'].items()
+                  ]
+              notes = Path(f'{archive.stem}.notes.md')
+              notes.write_text('\n'.join(lines) + '\n')
+              plan.append('\t'.join((tag, archive.name, checksum.name, metadata.name, notes.name)))
+          Path('release-plan.tsv').write_text('\n'.join(plan) + '\n')
+          PY
+          # Check every existing tag before creating any releases.
+          while IFS=$'\t' read -r tag archive checksum metadata notes; do
+            git check-ref-format "refs/tags/$tag"
+            if git show-ref --verify --quiet "refs/tags/$tag"; then
+              tagged_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+              if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+                echo "Tag $tag points to a different commit than this build." >&2
+                exit 1
+              fi
+            fi
+          done < release-plan.tsv
+          flags=()
+          if [[ "$DRAFT" == true ]]; then flags+=(--draft); fi
+          if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
+          while IFS=$'\t' read -r tag archive checksum metadata notes; do
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "$tag" \
+              --notes-file "$notes" \
+              "${flags[@]}" \
+              "$archive" "$checksum" "$metadata"
+          done < release-plan.tsv

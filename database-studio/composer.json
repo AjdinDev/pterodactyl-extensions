@@ -1,0 +1,12 @@
+{
+    "license": "proprietary",
+    "description": "Browse, query, edit, import and export managed MySQL databases.",
+    "autoload": {
+        "psr-4": {
+            "DatabaseStudio\\": "src/"
+        }
+    },
+    "config": {
+        "autoloader-suffix": "DatabaseStudioExtension"
+    }
+}
